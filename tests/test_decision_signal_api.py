@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
-from src.storage import DatabaseManager, DecisionSignalRecord, PortfolioAccount, PortfolioPosition, utc_naive_now
+from src.storage import AnalysisHistory, DatabaseManager, DecisionSignalRecord, PortfolioAccount, PortfolioPosition, utc_naive_now
 
 
 @contextmanager
@@ -173,6 +174,7 @@ def test_create_duplicate_list_detail_latest_and_status_update(client_and_db) ->
     signal_id = created["item"]["id"]
     assert created["item"]["stock_code"] == "600519"
     assert created["item"]["plan_quality"] == "partial"
+    assert created["item"]["expires_at"] is not None
 
     duplicate_resp = client.post(
         "/api/v1/decision-signals",
@@ -226,13 +228,12 @@ def test_create_duplicate_list_detail_latest_and_status_update(client_and_db) ->
     assert clear_metadata_resp.json()["status"] == "archived"
     assert clear_metadata_resp.json()["metadata"] is None
 
-    status_only_resp = client.patch(
+    terminal_reactivate_resp = client.patch(
         f"/api/v1/decision-signals/{signal_id}/status",
         json={"status": "active"},
     )
-    assert status_only_resp.status_code == 200, status_only_resp.text
-    assert status_only_resp.json()["status"] == "active"
-    assert status_only_resp.json()["metadata"] is None
+    assert terminal_reactivate_resp.status_code == 400, terminal_reactivate_resp.text
+    assert terminal_reactivate_resp.json()["error"] == "validation_error"
 
     invalid_status_resp = client.patch(
         f"/api/v1/decision-signals/{signal_id}/status",
@@ -243,6 +244,28 @@ def test_create_duplicate_list_detail_latest_and_status_update(client_and_db) ->
 
     missing_resp = client.get("/api/v1/decision-signals/999999")
     assert missing_resp.status_code == 404
+
+
+def test_create_treats_null_lifecycle_fields_as_missing(client_and_db) -> None:
+    client, _db = client_and_db
+
+    response = client.post(
+        "/api/v1/decision-signals",
+        json=_payload(
+            source_report_id=3002,
+            trace_id="trace-null-lifecycle-api",
+            horizon=None,
+            expires_at=None,
+            market_phase="intraday",
+            metadata={"market_phase_summary": {"minutes_to_close": 25}},
+        ),
+    )
+
+    assert response.status_code == 200, response.text
+    item = response.json()["item"]
+    assert item["status"] == "active"
+    assert item["horizon"] == "intraday"
+    assert item["expires_at"] is not None
 
 
 def test_status_update_sanitizes_metadata_before_response_and_persistence(client_and_db) -> None:
@@ -398,7 +421,6 @@ def test_patch_status_rejects_expired_signal_without_expires_at_extension(client
     assert created_resp.status_code == 200, created_resp.text
     item = created_resp.json()["item"]
     assert item["status"] == "expired"
-    assert item["expires_at"] is None
 
     reactivate_resp = client.patch(
         f"/api/v1/decision-signals/{item['id']}/status",
@@ -481,6 +503,43 @@ def test_create_refreshes_expired_same_source_when_future_expiry_is_supplied(cli
         assert row.status == "active"
         assert row.reason == "fresh reason"
         assert row.trace_id == "trace-refresh-original"
+
+
+def test_create_invalidates_opposing_active_signal_and_latest_filters_it(client_and_db) -> None:
+    client, _db = client_and_db
+    buy_resp = client.post(
+        "/api/v1/decision-signals",
+        json=_payload(
+            source_report_id=31101,
+            trace_id="trace-api-opposing-buy",
+            action="buy",
+        ),
+    )
+    assert buy_resp.status_code == 200, buy_resp.text
+    buy = buy_resp.json()["item"]
+
+    sell_resp = client.post(
+        "/api/v1/decision-signals",
+        json=_payload(
+            source_report_id=31102,
+            trace_id="trace-api-opposing-sell",
+            action="sell",
+        ),
+    )
+    assert sell_resp.status_code == 200, sell_resp.text
+    sell = sell_resp.json()["item"]
+
+    old_resp = client.get(f"/api/v1/decision-signals/{buy['id']}")
+    assert old_resp.status_code == 200, old_resp.text
+    old = old_resp.json()
+    assert old["status"] == "invalidated"
+    assert old["metadata"]["invalidated_by_signal_id"] == sell["id"]
+
+    latest_resp = client.get("/api/v1/decision-signals/latest/600519", params={"limit": 5})
+    assert latest_resp.status_code == 200, latest_resp.text
+    latest = latest_resp.json()
+    assert latest["total"] == 1
+    assert latest["items"][0]["id"] == sell["id"]
 
 
 def test_create_does_not_refresh_expired_same_source_without_future_active_expiry(client_and_db) -> None:
@@ -1154,3 +1213,319 @@ def test_dedup_distinguishes_market_for_same_symbol(client_and_db) -> None:
     assert hk_resp.status_code == 200, hk_resp.text
     assert hk_resp.json()["created"] is True
     assert hk_resp.json()["item"]["id"] != us_resp.json()["item"]["id"]
+
+
+def _decision_signal_count(db: DatabaseManager) -> int:
+    with db.session_scope() as session:
+        return session.query(DecisionSignalRecord).count()
+
+
+def _save_reassess_history(
+    db: DatabaseManager,
+    *,
+    code: str = "600519",
+    report_type: str = "full",
+    operation_advice: str | None = "买入",
+    raw_result: dict | str | None = None,
+    context_snapshot: dict | str | None = None,
+    sentiment_score: int | None = 72,
+    stop_loss: float | None = 1600,
+    take_profit: float | None = 1850,
+) -> int:
+    raw_payload = raw_result
+    if isinstance(raw_payload, dict):
+        raw_payload = json.dumps(raw_payload, ensure_ascii=False)
+    context_payload = context_snapshot
+    if isinstance(context_payload, dict):
+        context_payload = json.dumps(context_payload, ensure_ascii=False)
+    with db.session_scope() as session:
+        row = AnalysisHistory(
+            query_id="query-reassess-test",
+            code=code,
+            name="贵州茅台",
+            report_type=report_type,
+            sentiment_score=sentiment_score,
+            operation_advice=operation_advice,
+            trend_prediction="震荡上行",
+            analysis_summary="趋势改善但需要风控。",
+            raw_result=raw_payload,
+            context_snapshot=context_payload,
+            ideal_buy=1680,
+            secondary_buy=1700,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        session.add(row)
+        session.flush()
+        return int(row.id)
+
+
+def _valid_reassess_raw(**overrides) -> dict:
+    raw = {
+        "action": "buy",
+        "operation_advice": "买入",
+        "sentiment_score": 72,
+        "confidence_level": "中",
+        "analysis_summary": "趋势改善但需要确认。",
+        "risk_warning": "跌破关键支撑需退出。",
+        "dashboard": {
+            "battle_plan": {
+                "sniper_points": {
+                    "ideal_buy": 1680,
+                    "secondary_buy": 1700,
+                    "stop_loss": 1600,
+                    "take_profit": 1850,
+                },
+                "action_checklist": ["放量突破", "资金流转正"],
+            },
+            "phase_decision": {
+                "watch_conditions": ["量能维持"],
+            },
+        },
+    }
+    raw.update(overrides)
+    return raw
+
+
+def _valid_reassess_context() -> dict:
+    return {
+        "market_phase_summary": {"phase": "intraday"},
+        "analysis_context_pack_overview": {
+            "data_quality": {"level": "usable"},
+        },
+    }
+
+
+def test_reassess_persist_true_rejects_before_db_lookup(client_and_db, monkeypatch) -> None:
+    client, db = client_and_db
+
+    def fail_service(*_args, **_kwargs):
+        raise AssertionError("DecisionSignalReassessService must not be instantiated for persist=true")
+
+    monkeypatch.setattr("api.v1.endpoints.decision_signals.DecisionSignalReassessService", fail_service)
+    before = _decision_signal_count(db)
+
+    response = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={
+            "source_report_id": 999999,
+            "decision_profile": "aggressive",
+            "persist": True,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "unsupported_operation"
+    assert response.json()["message"] == (
+        "Persisting reassessed decision_profile signals requires decision_profile "
+        "to be promoted to a first-class field."
+    )
+    assert _decision_signal_count(db) == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"decision_profile": "balanced", "persist": False},
+        {"source_report_id": 0, "decision_profile": "balanced", "persist": False},
+        {"source_report_id": 1, "decision_profile": "reckless", "persist": False},
+    ],
+)
+def test_reassess_schema_validation_errors(client_and_db, payload) -> None:
+    client, _db = client_and_db
+    response = client.post("/api/v1/decision-signals/reassess", json=payload)
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "extra_field",
+    [
+        "signal_id",
+        "action",
+        "score",
+        "confidence",
+        "horizon",
+        "invalidation",
+        "stop_loss",
+        "target_price",
+        "metadata",
+        "scoring_breakdown",
+        "guardrail_result",
+    ],
+)
+def test_reassess_forbids_extra_fields(client_and_db, extra_field) -> None:
+    client, _db = client_and_db
+    response = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={
+            "source_report_id": 1,
+            "decision_profile": "balanced",
+            "persist": False,
+            extra_field: "not-supported",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_reassess_error_mapping(client_and_db) -> None:
+    client, db = client_and_db
+
+    missing = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": 999999, "decision_profile": "balanced", "persist": False},
+    )
+    assert missing.status_code == 404
+    assert missing.json()["error"] == "source_report_not_found"
+
+    market_review_id = _save_reassess_history(
+        db,
+        report_type="market_review",
+        raw_result=_valid_reassess_raw(),
+        context_snapshot=_valid_reassess_context(),
+    )
+    non_stock = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": market_review_id, "decision_profile": "balanced", "persist": False},
+    )
+    assert non_stock.status_code == 400
+    assert non_stock.json()["error"] == "unsupported_report_type"
+
+    insufficient_id = _save_reassess_history(
+        db,
+        code="600519",
+        operation_advice=None,
+        raw_result={"analysis_summary": "仅有摘要，不能推断动作"},
+        context_snapshot=_valid_reassess_context(),
+    )
+    insufficient = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": insufficient_id, "decision_profile": "balanced", "persist": False},
+    )
+    assert insufficient.status_code == 400
+    assert insufficient.json()["error"] == "unsupported_report_snapshot"
+
+    unsupported_market_id = _save_reassess_history(
+        db,
+        code="NOT_A_VALID_US_SYMBOL",
+        raw_result=_valid_reassess_raw(),
+        context_snapshot=_valid_reassess_context(),
+    )
+    unsupported_market = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": unsupported_market_id, "decision_profile": "balanced", "persist": False},
+    )
+    assert unsupported_market.status_code == 400
+    assert unsupported_market.json()["error"] == "unsupported_report_snapshot"
+
+
+def test_reassess_success_preview_is_read_only_and_uses_opaque_metadata(client_and_db, monkeypatch) -> None:
+    client, db = client_and_db
+    record_id = _save_reassess_history(
+        db,
+        raw_result=_valid_reassess_raw(),
+        context_snapshot=_valid_reassess_context(),
+    )
+    monkeypatch.setattr(
+        "src.services.decision_signal_service.DecisionSignalService.create_signal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("create_signal must not be called")),
+    )
+    monkeypatch.setattr(
+        "src.services.decision_signal_service.DecisionSignalService.list_signals",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("list_signals must not be called")),
+    )
+    monkeypatch.setattr(
+        "src.services.analysis_context_builder._build_quote_block",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("reassess must not rebuild quote context")),
+    )
+    before = _decision_signal_count(db)
+
+    response = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": record_id, "decision_profile": "balanced", "persist": False},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["item"] is None
+    assert payload["created"] is False
+    assert payload["preview"]["action"] == payload["preview"]["metadata"]["guardrail_result"]["final_action"]
+    assert payload["preview"]["metadata"]["decision_profile"] == "balanced"
+    assert payload["preview"]["metadata"]["profile_source"] == "user_selected"
+    assert payload["preview"]["metadata"]["signal_generation_version"] == "decision-profile-reassess-v1"
+    assert payload["preview"]["metadata"]["scoring_version"] == "decision-profile-scoring-v1"
+    assert "scoring_breakdown" in payload["preview"]["metadata"]
+    assert payload["preview"]["metadata"]["data_quality_level"] == "medium"
+    assert payload["preview"]["entry_low"] == 1680
+    assert payload["preview"]["stop_loss"] == 1600
+    assert _decision_signal_count(db) == before
+
+
+def test_reassess_preview_prefers_stability_adjusted_score(client_and_db) -> None:
+    client, db = client_and_db
+    raw_result = _valid_reassess_raw(
+        action=None,
+        sentiment_score=72,
+        operation_advice="观望",
+    )
+    dashboard = raw_result["dashboard"]
+    dashboard["decision_score_calibration"] = {
+        "raw_score": 72,
+        "adjusted_score": 59,
+        "final_action": "watch",
+        "guardrail_reason": "资金流偏弱，先观望回撤到 45-59。",
+    }
+    raw_result["dashboard"] = dashboard
+    record_id = _save_reassess_history(
+        db,
+        raw_result=raw_result,
+        context_snapshot=_valid_reassess_context(),
+    )
+
+    response = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": record_id, "decision_profile": "balanced", "persist": False},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["preview"]["score"] == 59
+    assert payload["preview"]["action"] == "watch"
+    assert payload["preview"]["metadata"]["guardrail_result"]["final_action"] == "watch"
+    assert _decision_signal_count(db) == 0
+
+
+def test_reassess_service_has_no_live_market_provider_imports() -> None:
+    source = (Path(__file__).resolve().parents[1] / "src/services/decision_signal_reassess_service.py").read_text(
+        encoding="utf-8"
+    )
+    assert "data_provider" not in source
+    assert "yfinance" not in source
+    assert "akshare" not in source
+    assert "build_decision_signal_payload_from_report" not in source
+
+
+def test_reassess_confidence_missing_buy_is_blocked_preview_not_persisted(client_and_db) -> None:
+    client, db = client_and_db
+    record_id = _save_reassess_history(
+        db,
+        raw_result=_valid_reassess_raw(confidence_level=None),
+        context_snapshot=_valid_reassess_context(),
+    )
+    before = _decision_signal_count(db)
+
+    response = client.post(
+        "/api/v1/decision-signals/reassess",
+        json={"source_report_id": record_id, "decision_profile": "aggressive", "persist": False},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    guardrail = payload["preview"]["metadata"]["guardrail_result"]
+    assert guardrail["raw_action"] == "buy"
+    assert guardrail["final_action"] in {"watch", "alert"}
+    assert guardrail["passed"] is False
+    assert "missing_confidence" in guardrail["violations"]
+    assert payload["blocked_reason"]
+    assert payload["warnings"]
+    assert {warning["code"] for warning in payload["warnings"]} >= {"action_blocked_by_guardrail"}
+    assert _decision_signal_count(db) == before

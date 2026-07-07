@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analysisApi, DuplicateTaskError } from '../../api/analysis';
@@ -7,6 +7,7 @@ import { historyApi } from '../../api/history';
 import { systemConfigApi } from '../../api/systemConfig';
 import { UiLanguageProvider } from '../../contexts/UiLanguageContext';
 import { useStockPoolStore } from '../../stores';
+import type { RunFlowSnapshot } from '../../types/runFlow';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 import { UI_LANGUAGE_STORAGE_KEY } from '../../utils/uiLanguage';
 import HomePage from '../HomePage';
@@ -28,6 +29,7 @@ vi.mock('../../api/history', () => ({
     getNews: vi.fn().mockResolvedValue({ total: 0, items: [] }),
     getMarkdown: vi.fn().mockResolvedValue('# report'),
     getDiagnostics: vi.fn(),
+    getRecordFlow: vi.fn(),
     getStockBarList: vi.fn().mockResolvedValue({ total: 0, items: [] }),
     deleteByCode: vi.fn(),
   },
@@ -42,6 +44,7 @@ vi.mock('../../api/analysis', async () => {
       triggerMarketReview: vi.fn(),
       getStatus: vi.fn(),
       getTasks: vi.fn(),
+      getTaskFlow: vi.fn(),
     },
   };
 });
@@ -118,6 +121,62 @@ const marketReviewHistoryReport = {
   },
 };
 
+const runFlowSnapshot: RunFlowSnapshot = {
+  taskId: 'task-1',
+  traceId: 'trace-1',
+  stockCode: '600519',
+  stockName: '贵州茅台',
+  status: 'running',
+  generatedAt: '2026-06-08T08:00:00Z',
+  summary: {
+    elapsedMs: 1200,
+    failedAttempts: 0,
+    fallbackCount: 0,
+    dataSourceCount: 1,
+    eventCount: 1,
+  },
+  lanes: [
+    { id: 'entry', label: '入口', order: 1 },
+    { id: 'analysis', label: '分析引擎', order: 2 },
+  ],
+  nodes: [
+    {
+      id: 'request',
+      lane: 'entry',
+      kind: 'entry',
+      label: '用户请求',
+      status: 'success',
+    },
+    {
+      id: 'analysis',
+      lane: 'analysis',
+      kind: 'analysis',
+      label: '分析流程',
+      status: 'running',
+    },
+  ],
+  edges: [
+    {
+      id: 'request-analysis',
+      from: 'request',
+      to: 'analysis',
+      kind: 'control',
+      status: 'running',
+      label: '调度',
+    },
+  ],
+  events: [
+    {
+      id: 'evt-1',
+      timestamp: '2026-06-08T08:00:00Z',
+      severity: 'info',
+      type: 'task_started',
+      nodeId: 'analysis',
+      title: '任务开始',
+    },
+  ],
+};
+
 describe('HomePage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -138,6 +197,8 @@ describe('HomePage', () => {
       components: {},
       copyText: 'data_status: unknown',
     });
+    vi.mocked(historyApi.getRecordFlow).mockResolvedValue(runFlowSnapshot);
+    vi.mocked(analysisApi.getTaskFlow).mockResolvedValue(runFlowSnapshot);
     vi.mocked(systemConfigApi.getSetupStatus).mockResolvedValue({
       isComplete: true,
       readyForSmoke: true,
@@ -230,6 +291,72 @@ describe('HomePage', () => {
     expect(screen.getByRole('heading', { name: '开始分析', level: 3 })).toBeInTheDocument();
     expect(screen.getByText('输入股票代码进行分析，或从左侧选择历史报告查看。')).toBeInTheDocument();
     expect(screen.getByText('暂无个股记录')).toBeInTheDocument();
+  });
+
+  it('opens the run-flow drawer from an active task in TaskPanel', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+    vi.mocked(analysisApi.getTasks).mockResolvedValue({
+      total: 1,
+      pending: 0,
+      processing: 1,
+      tasks: [
+        {
+          taskId: 'task-1',
+          traceId: 'trace-1',
+          stockCode: '600519',
+          stockName: '贵州茅台',
+          status: 'processing',
+          progress: 35,
+          message: '分析中',
+          reportType: 'detailed',
+          createdAt: '2026-06-08T08:00:00Z',
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '查看 贵州茅台 运行流' }));
+
+    await waitFor(() => {
+      expect(analysisApi.getTaskFlow).toHaveBeenCalledWith('task-1');
+    });
+    expect(await screen.findByTestId('run-flow-panel')).toBeInTheDocument();
+    expect(screen.getByText('贵州茅台 运行流')).toBeInTheDocument();
+  });
+
+  it('opens the run-flow drawer from completed report diagnostics', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 1,
+      page: 1,
+      limit: 20,
+      items: [historyItem],
+    });
+    vi.mocked(historyApi.getDetail).mockResolvedValue(historyReport);
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByText('运行状态'));
+    fireEvent.click(screen.getByRole('button', { name: '查看历史记录 1 运行流' }));
+
+    await waitFor(() => {
+      expect(historyApi.getRecordFlow).toHaveBeenCalledWith(1);
+    });
+    expect(await screen.findByTestId('run-flow-panel')).toBeInTheDocument();
+    expect(screen.getByText('贵州茅台 历史运行流')).toBeInTheDocument();
   });
 
   it('shows market review history in the stock bar', async () => {
@@ -355,6 +482,128 @@ describe('HomePage', () => {
       expect(screen.getByText(/股票 600519 正在分析中/)).toBeInTheDocument();
     });
     expect(screen.getByText(/股票 600519 正在分析中/).closest('[role="alert"]')).toBeInTheDocument();
+  });
+
+  it('dismisses the duplicate task banner when its close button is clicked', async () => {
+    vi.mocked(historyApi.getList).mockResolvedValue({
+      total: 0,
+      page: 1,
+      limit: 20,
+      items: [],
+    });
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    await screen.findByPlaceholderText('输入股票代码或名称，如 600519、贵州茅台、AAPL');
+
+    act(() => {
+      useStockPoolStore.setState({ duplicateError: '股票 600519 正在分析中，请等待完成' });
+    });
+
+    expect(screen.getByText(/股票 600519 正在分析中/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+
+    expect(screen.queryByText(/股票 600519 正在分析中/)).not.toBeInTheDocument();
+  });
+
+  it('auto-dismisses the duplicate task banner after 5 seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(historyApi.getList).mockResolvedValue({
+        total: 0,
+        page: 1,
+        limit: 20,
+        items: [],
+      });
+
+      render(
+        <MemoryRouter>
+          <HomePage />
+        </MemoryRouter>,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      act(() => {
+        useStockPoolStore.setState({ duplicateError: '股票 600519 正在分析中，请等待完成' });
+      });
+
+      expect(screen.getByText(/股票 600519 正在分析中/)).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4999);
+      });
+      expect(screen.getByText(/股票 600519 正在分析中/)).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(screen.queryByText(/股票 600519 正在分析中/)).not.toBeInTheDocument();
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('restarts the auto-dismiss countdown when a duplicate task is triggered again', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(historyApi.getList).mockResolvedValue({
+        total: 0,
+        page: 1,
+        limit: 20,
+        items: [],
+      });
+
+      render(
+        <MemoryRouter>
+          <HomePage />
+        </MemoryRouter>,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      act(() => {
+        useStockPoolStore.setState({ duplicateError: '股票 600519 正在分析中，请等待完成' });
+      });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(screen.getByText(/股票 600519 正在分析中/)).toBeInTheDocument();
+
+      // Trigger the duplicate prompt again (the store clears then re-sets the message).
+      act(() => {
+        useStockPoolStore.setState({ duplicateError: null });
+      });
+      act(() => {
+        useStockPoolStore.setState({ duplicateError: '股票 600519 正在分析中，请等待完成' });
+      });
+
+      // 4s after the restart: still within the fresh 5s window because the countdown reset.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(screen.getByText(/股票 600519 正在分析中/)).toBeInTheDocument();
+
+      // Crossing the fresh 5s threshold finally closes the banner.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.queryByText(/股票 600519 正在分析中/)).not.toBeInTheDocument();
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 
   it('submits market review from the home toolbar', async () => {
@@ -619,7 +868,7 @@ describe('HomePage', () => {
     expect(marketReviewReport.className).not.toContain('overflow-y-auto');
     expect(screen.getByRole('heading', { name: '结构化大盘数据' })).toBeInTheDocument();
     expect(screen.getByText('3200')).toBeInTheDocument();
-    expect(screen.getByText('3150.2')).toBeInTheDocument();
+    expect(screen.getByText('3150.20')).toBeInTheDocument();
     expect(marketReviewReport.querySelector('h2, h3')?.textContent).not.toBe('A股市场复盘');
     expect(screen.getByRole('heading', { name: '指数概览' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '风险提示' })).toBeInTheDocument();
