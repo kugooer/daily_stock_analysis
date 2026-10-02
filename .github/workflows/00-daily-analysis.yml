@@ -39,6 +39,15 @@ jobs:
       
       - name: 检出代码
         uses: actions/checkout@v5
+
+      - name: 检查今日是否为 A 股交易日
+        id: trading_day_check
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TUSHARE_HTTP_URL: ${{ vars.TUSHARE_HTTP_URL || secrets.TUSHARE_HTTP_URL }}
+          FORCE_RUN: ${{ github.event.inputs.force_run }}
+          TRADING_DAY_CHECK_ENABLED: ${{ vars.TRADING_DAY_CHECK_ENABLED || secrets.TRADING_DAY_CHECK_ENABLED || 'true' }}
+        run: python scripts/check_trading_day.py
       
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
