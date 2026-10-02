@@ -57,6 +57,7 @@ jobs:
           mkdir -p data logs reports
       
       - name: 执行股票分析
+        if: steps.trading_day_check.outputs.is_trading_day != 'false'
         env:
           # ==========================================
           # AI 配置
